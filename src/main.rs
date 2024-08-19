@@ -12,8 +12,6 @@ use std::collections::HashMap;
 
 use rand::prelude::*;
 
-use itertools::Itertools;
-
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
@@ -310,10 +308,30 @@ impl App {
     }
 
     fn student_absent(&mut self) {
+        assert!(self.student_display.is_some());
+        let s = self.student_display.as_ref().unwrap();
+
+        let s = self
+            .students
+            .get_mut(&s.email)
+            .expect("Student database became inconsistent with active student");
+
+        s.absent += 1;
+        self.update_data();
         self.student_escape();
     }
 
     fn student_defer(&mut self) {
+        assert!(self.student_display.is_some());
+        let s = self.student_display.as_ref().unwrap();
+
+        let s = self
+            .students
+            .get_mut(&s.email)
+            .expect("Student database became inconsistent with active student");
+
+        s.deferrals += 1;
+        self.update_data();
         self.student_escape();
     }
 
@@ -334,31 +352,39 @@ impl App {
     // Brutally inefficient, but luckily my classes have only ~70
     // students!
     fn randomize(&mut self) {
-        let (max, min) = self
-            .students
-            .iter()
-            .fold((0, std::usize::MAX), |(max, min), (_, s)| {
-                (
-                    cmp::max(max, s.participation_score),
-                    cmp::min(min, s.participation_score),
-                )
-            });
+        let (max, min) =
+            self.students
+                .iter()
+                .fold((std::isize::MIN, std::isize::MAX), |(max, min), (_, s)| {
+                    (
+                        cmp::max(max, s.participation_score as isize - s.deferrals as isize),
+                        cmp::min(min, s.participation_score as isize - s.deferrals as isize),
+                    )
+                });
 
         let mut bag = Vec::new();
-        let norm = max - min;
+        let norm = (max - min) as usize;
+        let adjust = min.abs() as usize;
         for (_, s) in self.students.iter_mut() {
             // Normalize and scale the participation scores
-            let chances: usize = norm - (s.participation_score - min);
-            // And add a corresponding number of tokens
+            assert!(adjust >= s.deferrals);
+            let p: usize = s.participation_score + adjust - s.deferrals;
+            let chances: usize = norm - p;
+            // And add a corresponding number of tokens -- more tokens
+            // for students with smaller `participation_score` to
+            // increase the chance their token is drawn.
             for _ in 0..=chances {
                 bag.push(s.email.clone());
             }
 
-	    // Since we're looking at the student, lets compute their
-	    // circle's color
-	    let color: usize = (((s.participation_score - min) as f64 / norm as f64) * 4.0).round() as usize;
-	    s.color = color;
-	}
+            // Since we're looking at the student, lets compute their
+            // circle's color. There are 5 colors, so select student
+            // colors as an offset into a 5 color array.
+            let color: usize = ((p as f64 / norm as f64) * 4.0).round() as usize;
+            s.color = color;
+            // hardcoded the number of items in COLORS
+            assert!(color < 5);
+        }
         let mut rng = rand::thread_rng();
         bag.shuffle(&mut rng);
 
@@ -379,7 +405,30 @@ impl App {
     // corresponding data-structures, and the db.
     fn update_data(&mut self) {
         self.randomize();
+	self.serialize_csv().unwrap();
         // TODO: write back to the DB.
+    }
+
+    fn serialize_csv(&self) -> anyhow::Result<()> {
+	let path = format!("{}.out", self.db.clone().into_string().unwrap());
+        let newfile = File::create(&path);
+
+	let file = if newfile.is_ok() {
+	    newfile.unwrap()
+	} else {
+	    File::open(&path)?
+	};
+        let mut writer = csv::WriterBuilder::new()
+	    .has_headers(true)
+	    .delimiter(b'\t')
+	    .flexible(true)
+	    .from_writer(file);
+
+        for (_, s) in &self.students {
+            writer.serialize(s)?;
+        }
+
+        return Ok(());
     }
 }
 
@@ -619,7 +668,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     if let Some(s) = &app.student_display {
         let area = centered_rect(60, 20, area);
-        let block = Paragraph::new(format!("{s}"))
+        let block = Paragraph::new(format!("🎉{s}🎉"))
             .style(Style::default())
             .alignment(Alignment::Center)
             .block(Block::bordered().title("Student").padding(Padding::new(
