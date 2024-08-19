@@ -1,72 +1,147 @@
 // Mostly an example taken from https://github.com/ratatui-org/ratatui/blob/main/examples/user_input.rs
 
-use std::{error::Error, io};
+use std::{cmp, env, ffi::OsString, fmt, fs::File, io};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
+use anyhow;
+use serde::{Deserialize, Serialize};
+
+use std::collections::HashMap;
+
+use rand::prelude::*;
+
+use itertools::Itertools;
+
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            KeyModifiers,
+        },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
     layout::{Constraint, Layout, Position},
+    prelude::{Alignment, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, List, ListItem, Paragraph},
+    widgets::{Block, Clear, List, ListItem, Padding, Paragraph},
     Frame, Terminal,
 };
 
 enum InputMode {
-    Query,
+    Command,
     Searching,
+    Student,
 }
 
 #[derive(Clone)]
+enum DisplayMode {
+    Command,
+    Searching,
+}
+
+type StudentKey = String;
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Student {
     name: String,
+    email: StudentKey,
     participation_score: usize,
+    deferrals: usize,
+    absent: usize,
+    #[serde(skip_serializing, default)]
+    answered_today: usize,
+    #[serde(skip_serializing, default)]
+    color: usize, // the offset into COLORS
 }
 
-impl Student {
-    fn new(name: String, participation_score: usize) -> Student {
-        Student {
-            name,
-            participation_score,
-        }
+const COLORS: &str = "🔴🟠🟡🟢🔵";
+
+impl fmt::Display for Student {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let flames = "🔥".to_string().repeat(self.answered_today);
+        let cs: Vec<_> = COLORS.chars().collect();
+        write!(
+            f,
+            "{}{:3} {} {}",
+            cs[self.color], self.participation_score, flames, self.name
+        )
     }
-}
-
-enum SelectionDirection {
-    Up,
-    Down,
 }
 
 /// App holds the state of the application
 struct App {
+    /// Backing file containing all of the students
+    db: OsString,
     /// Current value of the input box
     input: String,
     /// Position of cursor in the editor area.
     character_index: usize,
-    /// Current input mode
-    input_mode: InputMode,
-    /// The entry that is selected
-    selection: usize,
-    /// History of recorded messages
-    students: Vec<Student>,
+    /// How the main screen should render
+    display_mode: DisplayMode,
+    /// Display the selected student in a popout
+    student_display: Option<Student>,
+    /// All students, indexed by github id
+    students: HashMap<StudentKey, Student>,
+    /// The order to display students outside of search mode
+    order: Vec<StudentKey>,
+    /// The filtered, sorted view of students
+    view: Vec<StudentKey>,
+    /// The offset of the selected entry into the view
+    selection: Option<usize>,
+}
+
+fn deserialize_file(file_path: &OsString) -> anyhow::Result<HashMap<StudentKey, Student>> {
+    let file = File::open(file_path)?;
+
+    let mut f = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .comment(Some(b'#'))
+        .flexible(true)
+        .from_reader(file);
+
+    let mut students = HashMap::new();
+    for s_rec in f.deserialize() {
+        let s: Student = s_rec?;
+        let email = s.email.trim().to_string();
+
+        students.insert(
+            email.clone(),
+            Student {
+                name: s.name.trim().to_string(),
+                email,
+                participation_score: s.participation_score,
+                deferrals: s.deferrals,
+                absent: s.absent,
+                answered_today: 0,
+                color: 0,
+            },
+        );
+    }
+
+    Ok(students)
 }
 
 impl App {
-    const fn new() -> Self {
-        Self {
+    fn new(db: OsString) -> anyhow::Result<Self> {
+        let students = deserialize_file(&db)?;
+
+        let mut s = Self {
+            db,
             input: String::new(),
-            input_mode: InputMode::Query,
-            students: Vec::new(),
+            display_mode: DisplayMode::Command,
+            student_display: None,
+            students,
             character_index: 0,
-            selection: 0,
-        }
+            selection: None,
+            view: Vec::new(),
+            order: Vec::new(),
+        };
+        s.randomize();
+        Ok(s)
     }
 
     fn move_cursor_left(&mut self) {
@@ -80,24 +155,91 @@ impl App {
     }
 
     fn move_selection_up(&mut self) {
-        if self.selection > 0 {
-            self.selection = self.selection - 1;
-        };
+        if self.selection == None {
+            return;
+        }
+        let sel = self.selection.unwrap();
+        if sel > 0 {
+            self.selection = Some(sel - 1);
+        }
     }
 
     fn move_selection_down(&mut self) {
-	self.selection = self.selection + 1;
+        if self.selection == None {
+            return;
+        }
+        let sel = self.selection.unwrap();
+        if sel < self.view.len() - 1 {
+            self.selection = Some(sel + 1);
+        }
     }
 
     fn selection_reset(&mut self) {
-	self.selection = 0;
+        if self.view.len() > 0 {
+            self.selection = Some(0);
+        } else {
+            self.selection = None;
+        }
+    }
+
+    fn students_view(&self) -> &Vec<StudentKey> {
+        &self.view
+    }
+
+    fn selected_student(&self) -> Option<&Student> {
+        let sel = self.selection?;
+        assert!(self.view.len() >= sel);
+        Some(
+            &self
+                .students
+                .get(&self.view[sel])
+                .expect("View has a stale student not in the student db."),
+        )
+    }
+
+    fn update_student_view(&mut self) {
+        let view = if self.input.len() != 0 {
+            // If there's an active search term, use fuzzy matching
+            let matcher = SkimMatcherV2::default();
+            let mut matched: Vec<(Student, i64)> = self
+                .students
+                .iter()
+                .filter_map(|(_, entry)| {
+                    if let Some(score) =
+                        matcher.fuzzy_match(&entry.name.to_lowercase(), &self.input.to_lowercase())
+                    {
+                        Some((entry.clone(), score))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            matched.sort_by(|(_, a), (_, b)| b.cmp(&a));
+            matched.into_iter().map(|(s, _)| s.email).collect()
+        } else {
+            // Otherwise just the order is random, biased by
+            // participation score, see `randomize` below.
+            self.order
+                .iter()
+                .map(|key| {
+                    self.students
+                        .get(key)
+                        .expect("The order is inconsistent and has a student not in the db.")
+                        .email
+                        .clone()
+                })
+                .collect()
+        };
+
+        self.view = view;
+        self.selection_reset();
     }
 
     fn enter_char(&mut self, new_char: char) {
         let index = self.byte_index();
         self.input.insert(index, new_char);
         self.move_cursor_right();
-	self.selection_reset();
+        self.update_student_view();
     }
 
     /// Returns the byte index based on the character position.
@@ -132,7 +274,7 @@ impl App {
             self.input = before_char_to_delete.chain(after_char_to_delete).collect();
             self.move_cursor_left();
         }
-	self.selection_reset();
+        self.update_student_view();
     }
 
     fn clamp_cursor(&self, new_cursor_pos: usize) -> usize {
@@ -143,14 +285,116 @@ impl App {
         self.character_index = 0;
     }
 
-    fn submit_message(&mut self) {
-        self.students.push(Student::new(self.input.clone(), 0));
+    fn display_selected_student(&mut self) {
+        self.student_display = self.selected_student().map(|s| s.clone());
+    }
+
+    fn input_clear(&mut self) {
         self.input.clear();
         self.reset_cursor();
+        self.update_student_view();
+    }
+
+    fn input_mode(&self) -> InputMode {
+        if self.student_display.is_some() {
+            return InputMode::Student;
+        }
+        match self.display_mode {
+            DisplayMode::Command => InputMode::Command,
+            DisplayMode::Searching => InputMode::Searching,
+        }
+    }
+
+    fn student_escape(&mut self) {
+        self.student_display = None;
+    }
+
+    fn student_absent(&mut self) {
+        self.student_escape();
+    }
+
+    fn student_defer(&mut self) {
+        self.student_escape();
+    }
+
+    fn student_answer(&mut self) {
+        assert!(self.student_display.is_some());
+        let s = self.student_display.as_ref().unwrap();
+
+        let s = self
+            .students
+            .get_mut(&s.email)
+            .expect("Student database became inconsistent with active student");
+        s.participation_score += 1;
+        s.answered_today += 1;
+        self.update_data();
+        self.student_escape();
+    }
+
+    // Brutally inefficient, but luckily my classes have only ~70
+    // students!
+    fn randomize(&mut self) {
+        let (max, min) = self
+            .students
+            .iter()
+            .fold((0, std::usize::MAX), |(max, min), (_, s)| {
+                (
+                    cmp::max(max, s.participation_score),
+                    cmp::min(min, s.participation_score),
+                )
+            });
+
+        let mut bag = Vec::new();
+        let norm = max - min;
+        for (_, s) in self.students.iter_mut() {
+            // Normalize and scale the participation scores
+            let chances: usize = norm - (s.participation_score - min);
+            // And add a corresponding number of tokens
+            for _ in 0..=chances {
+                bag.push(s.email.clone());
+            }
+
+	    // Since we're looking at the student, lets compute their
+	    // circle's color
+	    let color: usize = (((s.participation_score - min) as f64 / norm as f64) * 4.0).round() as usize;
+	    s.color = color;
+	}
+        let mut rng = rand::thread_rng();
+        bag.shuffle(&mut rng);
+
+        let mut order = Vec::new();
+        for k in &bag {
+            if order.iter().find(|i| *i == k).is_none() {
+                order.push(k.clone());
+            }
+        }
+        assert!(self.students.len() == order.len());
+
+        self.order = order;
+        self.update_student_view();
+        self.selection_reset();
+    }
+
+    // The data has been updated, so we need to update all
+    // corresponding data-structures, and the db.
+    fn update_data(&mut self) {
+        self.randomize();
+        // TODO: write back to the DB.
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> anyhow::Result<()> {
+    //Result<(), Box<dyn Error>> {
+    if env::args_os().len() != 2 {
+        println!("Usage: {} student_list.csv\nwhere the csv file is tab-delimited and can have arbitrary names.", env::args_os().nth(0).unwrap().to_str().unwrap());
+        return Err(anyhow::anyhow!("Incorrect number of arguments"));
+    }
+    let file_path = env::args_os()
+        .nth(1)
+        .ok_or(anyhow::anyhow!("Argument {} not provided.", 1))?;
+
+    let app = App::new(file_path)?;
+
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -159,7 +403,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // create app and run it
-    let app = App::new();
     let res = run_app(&mut terminal, app);
 
     // restore terminal
@@ -183,18 +426,44 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
         terminal.draw(|f| ui(f, &app))?;
 
         if let Event::Key(key) = event::read()? {
-            match app.input_mode {
-                InputMode::Query => match key.code {
-                    KeyCode::Char('e') => {
-                        app.input_mode = InputMode::Searching;
+            match app.input_mode() {
+                InputMode::Command => match key.code {
+                    KeyCode::Char('s') | KeyCode::Char('/') => {
+                        app.display_mode = DisplayMode::Searching;
+                    }
+                    KeyCode::Char('r') => {
+                        app.randomize();
                     }
                     KeyCode::Char('q') => {
                         return Ok(());
                     }
+                    KeyCode::Down => {
+                        app.move_selection_down();
+                    }
+                    KeyCode::Up => {
+                        app.move_selection_up();
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.move_selection_up();
+                    }
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.move_selection_down();
+                    }
+                    KeyCode::Enter => {
+                        app.display_selected_student();
+                    }
                     _ => {}
                 },
                 InputMode::Searching if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Enter => app.submit_message(),
+                    KeyCode::Enter => {
+                        app.display_selected_student();
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.move_selection_up();
+                    }
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.move_selection_down();
+                    }
                     KeyCode::Char(to_insert) => {
                         app.enter_char(to_insert);
                     }
@@ -214,11 +483,30 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         app.move_selection_up();
                     }
                     KeyCode::Esc => {
-                        app.input_mode = InputMode::Query;
+                        app.display_mode = DisplayMode::Command;
+                        app.input_clear();
                     }
                     _ => {}
                 },
                 InputMode::Searching => {}
+                InputMode::Student => match key.code {
+                    // If student defers/delays
+                    KeyCode::Char('d') => {
+                        app.student_defer();
+                    }
+                    // If student is absent, or provides no answer
+                    KeyCode::Char('n') => {
+                        app.student_absent();
+                    }
+                    // If student answers like a boss
+                    KeyCode::Char('a') => {
+                        app.student_answer();
+                    }
+                    KeyCode::Esc => {
+                        app.student_escape();
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -230,26 +518,48 @@ fn ui(f: &mut Frame, app: &App) {
         Constraint::Length(3),
         Constraint::Min(1),
     ]);
-    let [help_area, input_area, messages_area] = vertical.areas(f.area());
+    let area = f.area();
+    let [help_area, input_area, students_area] = vertical.areas(area);
 
-    let (msg, style) = match app.input_mode {
-        InputMode::Query => (
+    let (msg, style) = match app.input_mode() {
+        InputMode::Command => (
             vec![
-                "Press ".into(),
                 "q".bold(),
-                " to exit, ".into(),
-                "e".bold(),
-                " to start editing.".bold(),
+                " = quit, ".into(),
+                "r".bold(),
+                " = randomize (biased), ".into(),
+                "s".bold(),
+                " = search, ".into(),
+                "↑".bold(),
+                " and ".into(),
+                "↓".bold(),
+                " = navigate students.".into(),
             ],
-            Style::default().add_modifier(Modifier::RAPID_BLINK),
+            Style::default(),
         ),
         InputMode::Searching => (
             vec![
-                "Press ".into(),
                 "Esc".bold(),
-                " to stop editing, ".into(),
+                " = go back, ".into(),
                 "Enter".bold(),
-                " to record the message".into(),
+                " = select a student, ".into(),
+                "↑".bold(),
+                " and ".into(),
+                "↓".bold(),
+                " = navigate students.".into(),
+            ],
+            Style::default(),
+        ),
+        InputMode::Student => (
+            vec![
+                "Esc".bold(),
+                " to go back, ".into(),
+                "a".bold(),
+                " = answer, ".into(),
+                "n".bold(),
+                " = absent or no answer ".into(),
+                "d".bold(),
+                " = defer.".into(),
             ],
             Style::default(),
         ),
@@ -259,73 +569,89 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(help_message, help_area);
 
     let input = Paragraph::new(app.input.as_str())
-        .style(match app.input_mode {
-            InputMode::Query => Style::default(),
-            InputMode::Searching => Style::default().fg(Color::Green),
+        .style(match app.display_mode {
+            DisplayMode::Searching => Style::default().fg(Color::Green),
+            _ => Style::default(),
         })
         .block(Block::bordered().title("Query"));
     f.render_widget(input, input_area);
-    match app.input_mode {
+    match app.display_mode {
         // Hide the cursor. `Frame` does this by default, so we don't need to do anything here
-        InputMode::Query => {}
+        DisplayMode::Command => {}
 
         // Make the cursor visible and ask ratatui to put it at the specified coordinates after
         // rendering
         #[allow(clippy::cast_possible_truncation)]
-        InputMode::Searching => f.set_cursor_position(Position::new(
+        DisplayMode::Searching => f.set_cursor_position(Position::new(
             // Draw the cursor at the current position in the input field.
             // This position is can be controlled via the left and right arrow key
             input_area.x + app.character_index as u16 + 1,
             // Move one line down, from the border to the input line
             input_area.y + 1,
         )),
-    }
-
-    let output: Vec<Student> = if app.input.len() != 0 {
-        let matcher = SkimMatcherV2::default();
-        let mut matched: Vec<(Student, i64)> = app
-            .students
-            .iter()
-            .filter_map(|entry| {
-                if let Some(score) =
-                    matcher.fuzzy_match(&entry.name.to_lowercase(), &app.input.to_lowercase())
-                {
-                    Some((entry.clone(), score))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        matched.sort_by(|(_, a), (_, b)| a.cmp(&b));
-        matched.into_iter().map(|(s, _)| s).collect()
-    } else {
-        let mut out: Vec<(Student, i64)> = app
-            .students
-            .iter()
-            .map(|student| (student.clone(), 0))
-            .collect();
-        out.sort_by(|(_, a), (_, b)| a.cmp(&b));
-        out.into_iter().map(|(s, _)| s).collect()
     };
-
-    let messages: Vec<ListItem> = output
+    let students: Vec<ListItem> = app
+        .students_view()
         .iter()
         .enumerate()
-        .map(|(i, student)| {
-            let content = if i == app.selection {
+        .map(|(i, key)| {
+            let s = app
+                .students
+                .get(key)
+                .expect("View has inconsistent name with the student db.");
+            let content = if app.selection.is_some() && i == app.selection.unwrap() {
                 Line::from(Span::styled(
-                    format!("[{:6}] {}", student.participation_score, student.name),
+                    format!("{s}"),
                     Style::default().bg(Color::Green).fg(Color::Black),
                 ))
             } else {
-                Line::from(Span::raw(format!(
-                    "[{:6}] {}",
-                    student.participation_score, student.name
-                )))
+                Line::from(Span::raw(format!("{}", s)))
             };
             ListItem::new(content)
         })
         .collect();
-    let messages = List::new(messages).block(Block::bordered().title("Students"));
-    f.render_widget(messages, messages_area);
+    let students = List::new(students).block(
+        Block::bordered()
+            .title("Students")
+            .padding(Padding::new(2, 2, 1, 1)),
+    );
+    f.render_widget(students, students_area);
+
+    if let Some(s) = &app.student_display {
+        let area = centered_rect(60, 20, area);
+        let block = Paragraph::new(format!("{s}"))
+            .style(Style::default())
+            .alignment(Alignment::Center)
+            .block(Block::bordered().title("Student").padding(Padding::new(
+                0,
+                0,
+                area.height / 2 - 1,
+                0,
+            )))
+            .style(
+                Style::default()
+                    .bg(Color::Gray)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        f.render_widget(Clear, area); //this clears out the background
+        f.render_widget(block, area);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(r);
+
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup_layout[1])[1]
 }
