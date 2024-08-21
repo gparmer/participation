@@ -17,6 +17,9 @@ case $1 in
     rotate )
 	mv ${ROSTER_PATH}.out $ROSTER_PATH
 	;;
+    rm )
+	rm ${ROSTER_PATH}.out
+	;;
     * )
 	usage
 esac
