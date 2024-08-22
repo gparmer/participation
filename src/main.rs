@@ -576,7 +576,7 @@ fn ui(f: &mut Frame, app: &App) {
                 "q".bold(),
                 " = quit, ".into(),
                 "r".bold(),
-                " = randomize (biased), ".into(),
+                " = 🎲 randomize (biased), ".into(),
                 "s".bold(),
                 " = search, ".into(),
                 "↑".bold(),
@@ -671,7 +671,7 @@ fn ui(f: &mut Frame, app: &App) {
         let block = Paragraph::new(format!("🎉{s}🎉"))
             .style(Style::default())
             .alignment(Alignment::Center)
-            .block(Block::bordered().title("Student").padding(Padding::new(
+            .block(Block::bordered().title("Student ✋").padding(Padding::new(
                 0,
                 0,
                 area.height / 2 - 1,
