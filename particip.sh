@@ -18,7 +18,7 @@ case $1 in
     rotate )
 	date=$(date +"%Y-%m-%d")
 	# save the old one
-	mv $ROSTER_PATH $date.$ROSTER_PATH
+	mv $ROSTER_PATH $ROSTER_PATH.$date
 	# update it to the new one reflecting updates
 	mv $NEW_ROSTER_PATH $ROSTER_PATH
 	;;
