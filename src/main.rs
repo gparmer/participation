@@ -64,8 +64,8 @@ impl fmt::Display for Student {
         let cs: Vec<_> = COLORS.chars().collect();
         write!(
             f,
-            "{}{:3} {} {}",
-            cs[self.color], self.participation_score, flames, self.name
+            "{}{:3} {} {} {}",
+            cs[self.color], self.participation_score, flames, self.name, flames
         )
     }
 }
