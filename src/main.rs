@@ -513,9 +513,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.move_selection_down();
                     }
-                    KeyCode::Char(to_insert) => {
-                        app.enter_char(to_insert);
-                    }
                     KeyCode::Backspace => {
                         app.delete_char();
                     }
@@ -531,9 +528,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Up => {
                         app.move_selection_up();
                     }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+			app.display_mode = DisplayMode::Command;
+                        app.input_clear();
+                    }
                     KeyCode::Esc => {
                         app.display_mode = DisplayMode::Command;
                         app.input_clear();
+                    }
+                    KeyCode::Char(to_insert) => {
+                        app.enter_char(to_insert);
                     }
                     _ => {}
                 },
@@ -550,6 +554,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     // If student answers like a boss
                     KeyCode::Char('a') => {
                         app.student_answer();
+                    }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+			app.student_escape();
                     }
                     KeyCode::Esc => {
                         app.student_escape();
