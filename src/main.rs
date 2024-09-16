@@ -57,6 +57,7 @@ struct Student {
 }
 
 const COLORS: &str = "🔴🟠🟡🟢🔵";
+const NUM_COLORS: usize = 5;
 
 impl fmt::Display for Student {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -363,6 +364,7 @@ impl App {
                 });
 
         let mut bag = Vec::new();
+        let mut score_ordered = Vec::new();
         let norm = (max - min) as usize;
         let adjust = min.abs() as usize;
         for (_, s) in self.students.iter_mut() {
@@ -377,13 +379,7 @@ impl App {
                 bag.push(s.email.clone());
             }
 
-            // Since we're looking at the student, lets compute their
-            // circle's color. There are 5 colors, so select student
-            // colors as an offset into a 5 color array.
-            let color: usize = ((p as f64 / norm as f64) * 4.0).round() as usize;
-            s.color = color;
-            // hardcoded the number of items in COLORS
-            assert!(color < 5);
+            score_ordered.push((s.email.clone(), p));
         }
         let mut rng = rand::thread_rng();
         bag.shuffle(&mut rng);
@@ -396,6 +392,44 @@ impl App {
         }
         assert!(self.students.len() == order.len());
 
+        // sort by the computed score
+        score_ordered.sort_by(|(_, p0), (_, p2)| p0.cmp(p2));
+        // Calculate the colors by separating students into fifths
+        for (_, s) in self.students.iter_mut() {
+	    // Get the student's index, sorted by score.
+            let (i, p) = score_ordered.iter().enumerate().find_map(|(i, (e, p))| {
+                if s.email == *e {
+                    Some((i, p))
+                } else {
+                    None
+                }
+            }).expect("Could not find student when an entry must exist.");
+
+	    let quintile_sz: usize = (score_ordered.len() as f64 / NUM_COLORS as f64).ceil() as usize;
+	    let quintile: usize = i / quintile_sz;
+	    assert!(quintile < NUM_COLORS);
+	    let mut final_quintile = quintile;
+	    // this is odd, but necessary: if this student has the
+	    // same score as the last student in the previous
+	    // quintile, inherit the previous quitile. This must be
+	    // done recursively for all previous quintiles to handle
+	    // the case that all students that all students have the
+	    // same score.
+	    for q in (1..=quintile).rev() {
+		let prev_quint_score = score_ordered[(q * quintile_sz) - 1].1;
+
+		// The last element of the previous quintile has a
+		// different score, so we know we belong in our
+		    // quintile
+		if *p != prev_quint_score {
+		    break;
+		}
+		final_quintile = q - 1;
+	    }
+	    s.color = final_quintile;
+	    assert!(s.color < NUM_COLORS);
+        }
+
         self.order = order;
         self.update_student_view();
         self.selection_reset();
@@ -405,24 +439,24 @@ impl App {
     // corresponding data-structures, and the db.
     fn update_data(&mut self) {
         self.randomize();
-	self.serialize_csv().unwrap();
+        self.serialize_csv().unwrap();
         // TODO: write back to the DB.
     }
 
     fn serialize_csv(&self) -> anyhow::Result<()> {
-	let path = format!("{}.out", self.db.clone().into_string().unwrap());
+        let path = format!("{}.out", self.db.clone().into_string().unwrap());
         let newfile = File::create(&path);
 
-	let file = if newfile.is_ok() {
-	    newfile.unwrap()
-	} else {
-	    File::open(&path)?
-	};
+        let file = if newfile.is_ok() {
+            newfile.unwrap()
+        } else {
+            File::open(&path)?
+        };
         let mut writer = csv::WriterBuilder::new()
-	    .has_headers(true)
-	    .delimiter(b'\t')
-	    .flexible(true)
-	    .from_writer(file);
+            .has_headers(true)
+            .delimiter(b'\t')
+            .flexible(true)
+            .from_writer(file);
 
         for (_, s) in &self.students {
             writer.serialize(s)?;
@@ -529,7 +563,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         app.move_selection_up();
                     }
                     KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-			app.display_mode = DisplayMode::Command;
+                        app.display_mode = DisplayMode::Command;
                         app.input_clear();
                     }
                     KeyCode::Esc => {
@@ -556,7 +590,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         app.student_answer();
                     }
                     KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-			app.student_escape();
+                        app.student_escape();
                     }
                     KeyCode::Esc => {
                         app.student_escape();
